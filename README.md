@@ -44,6 +44,16 @@ We have released 4 models for different purposes:
 | v1.0    | seed-uvit-whisper-base ([🤗](https://huggingface.co/Plachta/Seed-VC/blob/main/DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema.pth)[📄](configs/presets/config_dit_mel_seed_uvit_whisper_base_f0_44k.yml))       | Singing Voice Conversion (SVC) | 44100         | Whisper-small                                                          | BigVGAN | 768        | 17       | 200M               | strong zero-shot performance, singing voice conversion |
 | v2.0    | hubert-bsqvae-small ([🤗](https://huggingface.co/Plachta/Seed-VC/blob/main/v2)[📄](configs/v2/vc_wrapper.yaml))                                                                                                            | Voice & Accent Conversion (VC) | 22050         | [ASTRAL-Quantization](https://github.com/Plachtaa/ASTRAL-quantization) | BigVGAN | 512        | 13       | 67M(CFM) + 90M(AR) | Best in suppressing source speaker traits              |
 
+### V3 (experimental, no released checkpoint yet)
+V3 is an additive architecture: Whisper-large-v3-turbo content encoder, BSQ content bottleneck trained with a CTC ASR loss, 44.1 kHz synthesis with BigVGAN-v2 (128 bands, 1024 FFT / 256 hop), a streaming DiT path with a cached reference prefix, and a headless real-time wrapper with echo cancellation and mic gain control. V1/V2 are unchanged. Design, trade-offs and validation results: [v3_upgrade_plan.md](v3_upgrade_plan.md).
+```bash
+python train_v3.py --config configs/v3/seed_vc_v3_44k.yml --dataset-dir <data> --run-name bn --stage bottleneck
+python train_v3.py --config configs/v3/seed_vc_v3_44k.yml --dataset-dir <data> --run-name dit --stage dit --bottleneck-ckpt runs/bn/v3_bottleneck_final.pth --init-from-v1 DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth
+python inference_v3.py --source <source-wav> --target <reference-wav> --checkpoint runs/dit/v3_dit_final.pth
+python realtime_v3.py --config configs/v3/seed_vc_v3_44k_rt.yml --checkpoint runs/dit/v3_dit_final.pth --reference <reference-wav>
+```
+Until a V3 checkpoint is trained, `--dry-run` runs the full pipeline with untrained weights (the output is noise), and `python tools/v3_dry_run.py` reports shapes, compatibility checks and per-stage timings.
+
 Checkpoints of the latest model release will be downloaded automatically when first run inference.  
 If you are unable to access huggingface for network reason, try using mirror by adding `HF_ENDPOINT=https://hf-mirror.com` before every command.
 
