@@ -32,10 +32,10 @@ import torch.nn.functional as F
 
 from modules.v3.content_encoder import CHUNK_SECONDS
 from modules.v3.content_encoder import SAMPLE_RATE as ENCODER_SR
+from modules.v3.device import AUTOCAST_DTYPES, as_float32, autocast, resolve_autocast_dtype, synchronize
 from modules.v3.flow_matching import PrefixCachedSampler
 
 QUANTUM = 0.02  # seconds; Whisper frame = SOLA unit
-AUTOCAST_DTYPES = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
 STAGES = ("encoder", "bottleneck_regulator", "dit", "vocoder", "sola")
 
 
@@ -109,17 +109,13 @@ class StreamingVoiceConverter:
         self.fade_in, self.fade_out = fade, 1 - fade
         if cfg.precision not in AUTOCAST_DTYPES:
             raise ValueError(f"precision must be one of {sorted(AUTOCAST_DTYPES)}")
-        self.autocast_dtype = AUTOCAST_DTYPES[cfg.precision]
-        if self.autocast_dtype is torch.float16 and device.type == "cpu":
-            print("[streaming] fp16 autocast is not useful on CPU; running the DiT in fp32 (use bf16 on CPU)")
-            self.autocast_dtype = None
+        self.autocast_dtype = resolve_autocast_dtype(device, cfg.precision)  # device-supported dtype or None
         self.sampler = None
         self.timings = deque(maxlen=200)
         self.reset()
 
     def _autocast(self):
-        return torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype or torch.float32,
-                              enabled=self.autocast_dtype is not None)
+        return autocast(self.device, self.autocast_dtype)
 
     # ----------------------------------------------------------------- state
     def reset(self):
@@ -136,7 +132,7 @@ class StreamingVoiceConverter:
         """ref_wave: 1-D float waveform at the model sample rate (first prompt_max_time seconds are used)."""
         m = self.model
         m._ensure_caches()
-        ref = torch.as_tensor(ref_wave, dtype=torch.float32, device=self.device).reshape(1, -1)
+        ref = as_float32(ref_wave, self.device).reshape(1, -1)
         ref = ref[:, : int(m.sr * self.cfg.prompt_max_time)]
         mel = m.mel_fn(ref)
         ref16 = m.resample(ref, m.sr, ENCODER_SR)
@@ -152,8 +148,7 @@ class StreamingVoiceConverter:
 
     # ------------------------------------------------------------- process
     def _sync(self):
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        synchronize(self.device)  # CUDA and MPS run asynchronously; stage timings need a barrier
 
     @torch.inference_mode()
     def process_block(self, block_16k):
@@ -161,7 +156,7 @@ class StreamingVoiceConverter:
         if self.sampler is None:
             raise RuntimeError("call set_reference() before process_block()")
         m = self.model
-        x = torch.as_tensor(block_16k, dtype=torch.float32, device=self.device).reshape(-1)
+        x = as_float32(block_16k, self.device).reshape(-1)
         if x.numel() != self.block_in:
             raise ValueError(f"expected {self.block_in} samples at 16 kHz, got {x.numel()}")
         stamps = [time.perf_counter()]

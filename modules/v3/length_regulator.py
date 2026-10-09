@@ -44,10 +44,11 @@ def time_alignment_index(n_out, out_rate, in_rate, n_in, out_start=0.0, in_start
     frame j is centred at ``in_start + j / in_rate``. ``time_scale`` stretches the
     output timeline (length_adjust > 1 => slower speech => time_scale = 1 / adjust).
     """
-    m = torch.arange(n_out, device=device, dtype=torch.float64)
+    # float64 on the CPU: absolute stream times grow without bound, and MPS has no float64.
+    m = torch.arange(n_out, dtype=torch.float64)
     t = out_start + (m + 0.5) / out_rate
     j = torch.floor((t * time_scale - in_start) * in_rate + 0.5)
-    return j.clamp(0, max(n_in - 1, 0)).long()
+    return j.clamp(0, max(n_in - 1, 0)).long().to(device)
 
 
 class TimeAlignedRegulator(nn.Module):

@@ -24,6 +24,8 @@ import shutil
 import sys
 
 os.environ.setdefault("HF_HUB_CACHE", "./checkpoints/hf_cache")
+if sys.platform == "darwin":  # must precede `import torch`: run ops missing on MPS on the CPU
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 import torchaudio
@@ -31,6 +33,7 @@ from tqdm import tqdm
 
 from data.v3_dataset import build_v3_dataloader
 from modules.v3.content_encoder import SAMPLE_RATE as ENCODER_SR
+from modules.v3.device import pick_device
 from modules.v3.model import SeedVCv3, load_v3_config
 from optimizers import build_optimizer
 
@@ -162,7 +165,7 @@ class V3Trainer:
     @torch.no_grad()
     def _to_16k(self, waves, wave_lens):
         sr = self.model.sr
-        w16 = torchaudio.functional.resample(waves, sr, ENCODER_SR)
+        w16 = self.model.resample(waves, sr, ENCODER_SR)  # CPU front-end on MPS
         return w16, (wave_lens.float() * ENCODER_SR / sr).long().clamp(max=w16.size(1))
 
     @torch.no_grad()
@@ -200,7 +203,7 @@ class V3Trainer:
         self._backward_step(loss)
         used = out["indices"][out["mask"]]
         return {"loss": loss.item(), "ctc": loss_ctc.item(), "recon": loss_recon.item(),
-                "entropy": loss_entropy.item(), "codes_used": int(used.unique().numel()),
+                "entropy": loss_entropy.item(), "codes_used": int(used.cpu().unique().numel()),
                 "ctc_items": len(keep)}
 
     def step_dit(self, batch):
@@ -267,7 +270,7 @@ def main(argv=None):
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default=None, help="cuda | mps | cpu (default: best available)")
     p.add_argument("--pretrained-ckpt", default=None, help="v3 checkpoint to start from")
     p.add_argument("--bottleneck-ckpt", default=None, help="stage A checkpoint (required for a useful stage B)")
     p.add_argument("--init-from-v1", default=None, help="v1 checkpoint path or file name in Plachta/Seed-VC")
@@ -279,7 +282,8 @@ def main(argv=None):
     if args.stage == "dit" and not args.bottleneck_ckpt and not args.pretrained_ckpt:
         print("WARNING: training the DiT on an untrained bottleneck; pass --bottleneck-ckpt from stage A")
     trainer = V3Trainer(args.config, args.dataset_dir, args.run_name, args.stage, args.batch_size, args.num_workers,
-                        args.max_steps, args.save_every, args.log_every, args.device, args.lr, args.pretrained_ckpt,
+                        args.max_steps, args.save_every, args.log_every, pick_device(args.device), args.lr,
+                        args.pretrained_ckpt,
                         args.bottleneck_ckpt, args.init_from_v1, args.perturb)
     trainer.train()
 

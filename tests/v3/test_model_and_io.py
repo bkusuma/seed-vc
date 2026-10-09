@@ -117,7 +117,7 @@ def test_warm_start_from_v1_checkpoint(tmp_path, tiny_model):
     model = build_tiny_model()
     report = model.warm_start_from_v1(path)["cfm"]
     assert report["loaded_params"] == report["total_params"] and not report["shape_mismatch"]
-    assert all(torch.equal(v1.state_dict()[k], model.cfm.state_dict()[k]) for k in v1.state_dict())
+    assert all(torch.equal(v1.state_dict()[k], model.cfm.state_dict()[k].cpu()) for k in v1.state_dict())
 
 
 # ------------------------------------------------------------- real-time io

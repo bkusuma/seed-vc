@@ -14,6 +14,7 @@ from modules.v3.bottleneck import ContentBottleneck, build_text_tokenizer
 from modules.v3.content_encoder import FRAME_RATE as CONTENT_RATE
 from modules.v3.content_encoder import SAMPLE_RATE as ENCODER_SR
 from modules.v3.content_encoder import WhisperContentEncoder
+from modules.v3.device import as_float32, frontend_device, half_precision_default
 from modules.v3.dit import ATTN_FULL
 from modules.v3.flow_matching import CFMv3
 from modules.v3.length_regulator import TimeAlignedRegulator
@@ -172,11 +173,11 @@ class SeedVCv3(nn.Module):
         return self.cfm.estimator.input_pos.device
 
     def prepare(self, device, half_encoder=None):
-        """Move to ``device``; run the Whisper encoder in fp16 on CUDA by default."""
+        """Move to ``device``; run the Whisper encoder in fp16 on CUDA and MPS by default."""
         device = torch.device(device)
         self.to(device)
         if self.content_encoder is not None:
-            half = device.type == "cuda" if half_encoder is None else half_encoder
+            half = half_precision_default(device) if half_encoder is None else half_encoder
             self.content_encoder.to(torch.float16 if half else torch.float32)
         self._ensure_caches()
         return self
@@ -193,22 +194,26 @@ class SeedVCv3(nn.Module):
 
     # ---------------------------------------------------------- features
     def resample(self, wave, orig_sr, new_sr):
-        return wave if orig_sr == new_sr else torchaudio.functional.resample(wave, orig_sr, new_sr)
+        if orig_sr == new_sr:
+            return wave
+        return torchaudio.functional.resample(wave.to(frontend_device(wave.device)), orig_sr, new_sr).to(wave.device)
 
     @torch.no_grad()
     def compute_style(self, waves_16k, wave_lens=None):
         """CAMPPlus speaker embedding (B, 192) from 16 kHz audio (v2 implementation)."""
         if wave_lens is None:
             wave_lens = torch.full((waves_16k.size(0),), waves_16k.size(-1), dtype=torch.long)
+        device = waves_16k.device
+        fdev = frontend_device(device)  # Kaldi fbank (FFT) on the CPU for MPS
         feats = []
         for b in range(waves_16k.size(0)):
-            feat = torchaudio.compliance.kaldi.fbank(waves_16k[b:b + 1, : int(wave_lens[b])].float(), num_mel_bins=80,
-                                                     dither=0, sample_frequency=ENCODER_SR)
+            wave = waves_16k[b:b + 1, : int(wave_lens[b])].float().to(fdev)
+            feat = torchaudio.compliance.kaldi.fbank(wave, num_mel_bins=80, dither=0, sample_frequency=ENCODER_SR)
             feats.append(feat - feat.mean(dim=0, keepdim=True))
         max_len = max(f.size(0) for f in feats)
-        feat_lens = torch.tensor([f.size(0) for f in feats], dtype=torch.int32, device=waves_16k.device) // 2
+        feat_lens = torch.tensor([f.size(0) for f in feats], dtype=torch.int32, device=device) // 2
         feats = torch.stack([torch.nn.functional.pad(f, (0, 0, 0, max_len - f.size(0)), value=float(f.min()))
-                             for f in feats])
+                             for f in feats]).to(device)
         return self.style_encoder(feats, feat_lens)
 
     @torch.no_grad()
@@ -246,8 +251,8 @@ class SeedVCv3(nn.Module):
             torch.manual_seed(seed)
         self._ensure_caches()
         device = self.device
-        src = torch.as_tensor(source, dtype=torch.float32, device=device).reshape(1, -1)
-        ref = torch.as_tensor(reference, dtype=torch.float32, device=device).reshape(1, -1)[:, : int(self.sr * max_prompt)]
+        src = as_float32(source, device).reshape(1, -1)
+        ref = as_float32(reference, device).reshape(1, -1)[:, : int(self.sr * max_prompt)]
         src16, ref16 = self.resample(src, self.sr, ENCODER_SR), self.resample(ref, self.sr, ENCODER_SR)
 
         feats_s, lens_s = self.extract_content(src16)

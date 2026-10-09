@@ -245,6 +245,11 @@ class ContentBottleneck(nn.Module):
             raise RuntimeError("ASR head was stripped; ctc_loss is training-only")
         logits = self.asr_head(out["quantized"].transpose(1, 2)).transpose(1, 2)  # (B, T, V)
         log_probs = logits.float().log_softmax(-1).transpose(0, 1)  # (T, B, V)
+        if log_probs.device.type == "mps":
+            # MPS CTC support depends on the PyTorch version; the CPU op is exact and cheap at
+            # 257 classes, and autograd carries the gradient back to the device.
+            log_probs, targets = log_probs.cpu(), targets.cpu()
+            feat_lens, target_lens = feat_lens.cpu(), target_lens.cpu()
         return F.ctc_loss(log_probs, targets, feat_lens, target_lens, blank=self.asr_blank_id,
                           reduction="mean", zero_infinity=True)
 

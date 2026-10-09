@@ -9,25 +9,18 @@ noise, but every tensor shape and the I/O path are exercised.
 """
 import argparse
 import os
+import sys
 import time
 
 os.environ.setdefault("HF_HUB_CACHE", "./checkpoints/hf_cache")
+if sys.platform == "darwin":  # must precede `import torch`: run ops missing on MPS on the CPU
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import librosa
 import soundfile as sf
-import torch
 
+from modules.v3.device import pick_device
 from modules.v3.model import SeedVCv3
-
-
-def pick_device(name=None):
-    if name:
-        return torch.device(name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def main(argv=None):
@@ -43,8 +36,10 @@ def main(argv=None):
     p.add_argument("--inference-cfg-rate", type=float, default=None)
     p.add_argument("--length-adjust", type=float, default=1.0)
     p.add_argument("--attn-mode", choices=("full", "prompt_isolated"), default=None)
+    p.add_argument("--max-context-seconds", type=float, default=30.0,
+                   help="DiT context per chunk (prompt + source); lower it on 8 GB Macs")
     p.add_argument("--max-source-seconds", type=float, default=None, help="truncate the source (quick tests)")
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default=None, help="cuda | mps | cpu (default: best available)")
     p.add_argument("--seed", type=int, default=None)
     args = p.parse_args(argv)
 
@@ -70,7 +65,7 @@ def main(argv=None):
     reference = librosa.load(args.target, sr=model.sr)[0]
     start = time.time()
     wave, info = model.convert(source, reference, args.diffusion_steps, args.inference_cfg_rate, args.length_adjust,
-                               args.attn_mode, seed=args.seed)
+                               args.attn_mode, max_context_seconds=args.max_context_seconds, seed=args.seed)
     elapsed = time.time() - start
     print("shapes:", info)
     print(f"RTF: {elapsed / (len(wave) / model.sr):.3f} ({elapsed:.1f}s for {len(wave) / model.sr:.1f}s)")

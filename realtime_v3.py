@@ -14,14 +14,17 @@ SOLA search) and, for live streams, the device latency reported by PortAudio.
 import argparse
 import json
 import os
+import sys
 
 os.environ.setdefault("HF_HUB_CACHE", "./checkpoints/hf_cache")
+if sys.platform == "darwin":  # must precede `import torch`: run ops missing on MPS on the CPU
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import librosa
 import numpy as np
 import soundfile as sf
 
-from inference_v3 import pick_device
+from modules.v3.device import pick_device
 from modules.v3.model import SeedVCv3
 from modules.v3.realtime_io import RealtimeVCStream, simulate_stream
 
@@ -45,13 +48,15 @@ def main(argv=None):
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--dry-run", action="store_true", help="allow running without a trained checkpoint")
     p.add_argument("--reference", required=True)
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default=None, help="cuda | mps | cpu (default: best available)")
     p.add_argument("--samplerate", type=int, default=None, help="device rate (default: model rate, 44100)")
     p.add_argument("--input-device", type=device_arg, default=None)
     p.add_argument("--output-device", type=device_arg, default=None)
     p.add_argument("--block-time", type=float, default=None)
     p.add_argument("--diffusion-steps", type=int, default=None)
     p.add_argument("--cfg-rate", type=float, default=None)
+    p.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default=None,
+                   help="DiT autocast (default from the config; fp16 for GPUs and Apple Silicon)")
     p.add_argument("--no-aec", action="store_true")
     p.add_argument("--no-agc", action="store_true")
     p.add_argument("--aec-delay-ms", type=float, default=0.0, help="far-end bulk delay compensation")
@@ -73,7 +78,7 @@ def main(argv=None):
         print("WARNING: no trained v3 checkpoint; output is not meaningful audio (dry run)")
     model.prepare(device).eval()
     overrides = {k: v for k, v in {"block_time": args.block_time, "diffusion_steps": args.diffusion_steps,
-                                   "cfg_rate": args.cfg_rate}.items() if v is not None}
+                                   "cfg_rate": args.cfg_rate, "precision": args.precision}.items() if v is not None}
     engine = model.streaming_engine(**overrides)
     engine.set_reference(librosa.load(args.reference, sr=model.sr)[0])
     stream = RealtimeVCStream(engine, samplerate=args.samplerate, input_device=args.input_device,

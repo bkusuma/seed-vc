@@ -2,7 +2,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from conftest import TINY_WHISPER, tiny_config
+from conftest import DEVICE, TINY_WHISPER, tiny_config
 from train_v3 import V3Trainer
 
 
@@ -21,7 +21,7 @@ def trainer(tmp_path, stage, **kw):
     cfg = tiny_config()
     cfg["log_dir"] = str(tmp_path / "runs")
     return V3Trainer(cfg, str(make_dataset(tmp_path)), "t", stage, batch_size=3, max_steps=2, save_every=1,
-                     device="cpu", encoder_pretrained=False, encoder_config=TINY_WHISPER, perturb="none", **kw)
+                     device=DEVICE, encoder_pretrained=False, encoder_config=TINY_WHISPER, perturb="none", **kw)
 
 
 def test_bottleneck_stage_step_and_resume(tmp_path):

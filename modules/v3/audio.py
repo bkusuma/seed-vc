@@ -15,6 +15,8 @@ import torch.nn.functional as F
 import torchaudio
 from librosa.filters import mel as librosa_mel_fn
 
+from modules.v3.device import as_float32, frontend_device
+
 
 def resolve_fmax(value):
     """Map YAML ``null`` / the strings "None" / "null" to None, anything else to float."""
@@ -52,10 +54,15 @@ class MelSpectrogram(torch.nn.Module):
         return int(num_samples) // self.hop_length
 
     def forward(self, y):
-        """y: (B, N) or (N,) float waveform in [-1, 1] -> (B, n_mels, N // hop)."""
+        """y: (B, N) or (N,) float waveform in [-1, 1] -> (B, n_mels, N // hop) on y's device.
+
+        The STFT runs on the CPU for MPS inputs (see modules/v3/device.py).
+        """
         if y.dim() == 1:
             y = y.unsqueeze(0)
-        y = y.float()
+        device = y.device
+        fdev = frontend_device(device)
+        y = y.float().to(fdev)
         pad = (self.n_fft - self.hop_length) // 2
         y = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
         spec = torch.stft(
@@ -63,7 +70,7 @@ class MelSpectrogram(torch.nn.Module):
             self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window.float(),
+            window=self.window.float().to(fdev),
             center=False,
             pad_mode="reflect",
             normalized=False,
@@ -71,8 +78,8 @@ class MelSpectrogram(torch.nn.Module):
             return_complex=True,
         )
         spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-9)
-        spec = torch.matmul(self.mel_basis.float(), spec)
-        return torch.log(torch.clamp(spec, min=1e-5))
+        spec = torch.matmul(self.mel_basis.float().to(fdev), spec)
+        return torch.log(torch.clamp(spec, min=1e-5)).to(device)
 
 
 class StreamingResampler:
@@ -110,7 +117,7 @@ class StreamingResampler:
     def __call__(self, block):
         if self.orig_sr == self.new_sr:
             return block
-        block = torch.as_tensor(block, dtype=torch.float32, device=self.device)
+        block = as_float32(block, self.device)
         n = block.numel()
         if n % self.in_unit != 0:
             raise ValueError(f"block length {n} must be a multiple of {self.in_unit} for {self.orig_sr}->{self.new_sr} Hz")

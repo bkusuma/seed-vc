@@ -11,11 +11,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("HF_HUB_CACHE", "./checkpoints/hf_cache")
+if sys.platform == "darwin":  # must precede `import torch`: run ops missing on MPS on the CPU
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import librosa
 import torch
 
 from data.v3_dataset import AUDIO_EXTENSIONS, find_transcript
+from modules.v3.device import pick_device
 
 
 def main(argv=None):
@@ -26,13 +29,14 @@ def main(argv=None):
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--limit", type=int, default=None, help="label at most N files (smoke tests)")
+    p.add_argument("--device", default=None, help="cuda | mps | cpu (default: best available)")
     args = p.parse_args(argv)
 
     from transformers import pipeline
 
-    cuda = torch.cuda.is_available()
-    asr = pipeline("automatic-speech-recognition", model=args.model, device=0 if cuda else -1,
-                   torch_dtype=torch.float16 if cuda else torch.float32)
+    device = pick_device(args.device)
+    asr = pipeline("automatic-speech-recognition", model=args.model, device=device,
+                   torch_dtype=torch.float16 if device.type in ("cuda", "mps") else torch.float32)
     files = sorted(os.path.join(r, f) for r, _, fs in os.walk(args.dataset_dir) for f in fs
                    if f.lower().endswith(AUDIO_EXTENSIONS))
     todo = [f for f in files if args.overwrite or not find_transcript(f)][: args.limit]

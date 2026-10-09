@@ -11,6 +11,11 @@ os.environ.setdefault("HF_HUB_CACHE", os.path.join(REPO_ROOT, "checkpoints", "hf
 
 from modules.commons import recursive_munch  # noqa: E402
 
+# Run the device-aware tests on another backend with e.g. `V3_TEST_DEVICE=mps python -m pytest tests/v3`.
+DEVICE = torch.device(os.environ.get("V3_TEST_DEVICE", "cpu"))
+# Accelerators may reorder / fuse fp32 reductions (TF32 on CUDA, MPS kernels): looser equality there.
+ATOL = 1e-5 if DEVICE.type == "cpu" else 2e-3
+
 TINY_WHISPER = dict(d_model=64, encoder_layers=2, encoder_attention_heads=2, encoder_ffn_dim=128, num_mel_bins=80,
                     max_source_positions=1500, decoder_layers=1, decoder_attention_heads=2, decoder_ffn_dim=128,
                     vocab_size=128, max_target_positions=64)
@@ -74,7 +79,7 @@ class FakeVocoder(torch.nn.Module):
         return torch.tanh(self.up(mel))
 
 
-def build_tiny_model(config=None, with_training_heads=False):
+def build_tiny_model(config=None, with_training_heads=False, device=None):
     from modules.v3.model import SeedVCv3
 
     cfg = recursive_munch(config or tiny_config())
@@ -82,7 +87,7 @@ def build_tiny_model(config=None, with_training_heads=False):
     model = SeedVCv3(cfg, encoder_pretrained=False, encoder_config=TINY_WHISPER, load_vocoder=False,
                      with_training_heads=with_training_heads)
     model.vocoder = FakeVocoder(cfg.preprocess_params.spect_params.n_mels, cfg.preprocess_params.spect_params.hop_length)
-    return model.prepare("cpu").eval()
+    return model.prepare(device or DEVICE).eval()
 
 
 @pytest.fixture(scope="session")

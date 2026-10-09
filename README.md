@@ -54,6 +54,13 @@ python realtime_v3.py --config configs/v3/seed_vc_v3_44k_rt.yml --checkpoint run
 ```
 Until a V3 checkpoint is trained, `--dry-run` runs the full pipeline with untrained weights (the output is noise), and `python tools/v3_dry_run.py` reports shapes, compatibility checks and per-stage timings.
 
+V3 on Apple Silicon (MPS): supported for offline conversion, dry runs and development. Real-time V3 does not fit any M1 GPU (FLOP budget in [v3_upgrade_plan.md §11](v3_upgrade_plan.md)). To check on your Mac:
+```bash
+V3_TEST_DEVICE=mps python -m pytest tests/v3 -q
+python tools/v3_dry_run.py --device mps --quick   # last line: achieved TFLOPS vs. real-time budget
+```
+On macOS, grant your terminal microphone access (System Settings → Privacy & Security → Microphone) before running `realtime_v3.py` live.
+
 Checkpoints of the latest model release will be downloaded automatically when first run inference.  
 If you are unable to access huggingface for network reason, try using mirror by adding `HF_ENDPOINT=https://hf-mirror.com` before every command.
 

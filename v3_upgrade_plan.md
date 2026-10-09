@@ -1,6 +1,6 @@
 # Seed-VC v3.0 — Technical Upgrade Plan
 
-Status: implemented on branch `claude/v3-upgrade` (see §9 for what was validated and how).
+Status: implemented on branch `claude/v3-upgrade` (§9: validation; §11: Apple Silicon).
 Scope: additive. v1 (`inference.py`, `real-time-gui.py`, `train.py`) and v2 (`*_v2.py`) are untouched.
 
 ---
@@ -38,6 +38,11 @@ Scope: additive. v1 (`inference.py`, `real-time-gui.py`, `train.py`) and v2 (`*_
    - MeanVoiceFlow2 (arXiv 2609.40087, Sep 2026).
 
    It needs a different training objective, so it is out of scope here. §10 lists it as the top follow-up.
+6. **Target hardware is an M1 MacBook Pro.** v3 now runs on Apple Silicon (MPS) for offline conversion and development (§11). **Real time does not fit any M1**:
+   - the real-time preset needs **11.2 TFLOPS sustained** (measured FLOPs);
+   - Apple quotes 2.6 / 5.2 / 10.4 TFLOPS FP32 peak for M1 / M1 Pro / M1 Max.
+
+   The Whisper-large-v3 encoder alone is 85% of that budget. *Confidence: high on the FLOPs; the conclusion holds even at 100% utilisation.*
 
 ---
 
@@ -126,6 +131,7 @@ Time alignment (train and inference identical): mel frame *m* uses content frame
 | `modules/v3/flow_matching.py` | `CFMv3`: mixed-mask training loss, offline sampler, `PrefixCachedSampler` |
 | `modules/v3/model.py` | `SeedVCv3` container, builder, checkpoint I/O, v1 warm start, offline `convert()` |
 | `modules/v3/streaming.py` | `StreamingVoiceConverter`: block engine (padded-window encoder, cached DiT, cropped vocoder, SOLA), latency report |
+| `modules/v3/device.py` | Device selection (CUDA > MPS > CPU), MPS-safe float32 transfer, CPU front-end placement, autocast dtype rules, synchronize |
 | `modules/v3/realtime_io.py` | `EchoCanceller`, `AutomaticGainControl`, `RealtimeVCStream` (sounddevice, lazy import), `simulate_stream` |
 | `data/v3_dataset.py` | 44.1 kHz/128-band dataset with optional transcript side-cars (`.txt`/`.lab`/`.normalized.txt`) |
 | `train_v3.py` | Stage `bottleneck` (CTC + recon + entropy) and stage `dit` (mixed-mask CFM) |
@@ -133,7 +139,7 @@ Time alignment (train and inference identical): mel frame *m* uses content frame
 | `realtime_v3.py` | Headless real-time CLI (`--simulate in.wav` works without audio hardware) |
 | `tools/pseudo_label_v3.py` | Whisper-v3-turbo transcription → side-car `.txt` for the CTC loss |
 | `tools/v3_dry_run.py` | Phase 4 end-to-end dry run + stage timing + shape report |
-| `tests/v3/*.py` | pytest suite (shapes, cache equivalence, alignment, Whisper log-mel parity, AEC ERLE, AGC, training step) |
+| `tests/v3/*.py` | pytest suite (shapes, cache equivalence, alignment, Whisper log-mel parity, AEC ERLE, AGC, training step, device portability / MPS guards; `V3_TEST_DEVICE=mps` runs it on Apple Silicon) |
 
 ### Modified files
 - `README.md` — short "V3 (experimental)" section pointing here.
@@ -283,7 +289,7 @@ Reversibility: everything is additive and behind new entry points. Deleting `mod
 
 ## 9. Validation results (Phase 4, CPU-only container)
 
-All of these are reproducible with `python -m pytest tests/v3` (46 passed, 1 opt-in slow test passed) and `python tools/v3_dry_run.py` (7/7 checks pass).
+All of these are reproducible with `python -m pytest tests/v3` (54 passed, 1 opt-in slow test passed) and `python tools/v3_dry_run.py` (7/7 checks pass).
 
 | Check | Result |
 |---|---|
@@ -322,7 +328,79 @@ Known limits of this validation:
 3. torch.compile / CUDA-graph capture of the cached-prefix sampler (eager kernel-launch overhead dominates small windows).
 4. Gradient-reversal speaker classifier on the bottleneck if leakage remains measurable.
 
-## 11. Open questions for you
-- Is the target GPU known? The `rt` preset sizes (DiT width, encoder layers, steps) should be tuned to it.
+## 11. Apple Silicon (M1) support
+
+**Status.** v3 runs on Apple Silicon (MPS) at the code level. Every MPS-specific risk found in an audit is fixed and guarded by tests. However, I have **not executed it on Metal**, because this container has no Mac. The three commands below confirm it on your M1.
+
+**Conclusion first:** v3 will run on an M1 for offline conversion, dry runs and small experiments. It **cannot run in real time on any M1**. That isn't a tuning problem; the FLOP budget below exceeds the chip.
+
+### Changes for MPS
+| Risk | Fix |
+|---|---|
+| float64 tensors can't exist on MPS, and there's no CPU fallback for dtypes. Two places hit this: time-alignment maths, and `torch.as_tensor(float64_numpy, dtype=float32, device=...)`, which materialises float64 first | float64 maths runs on the CPU; numpy input is cast to float32 on the CPU before transfer (`device.as_float32`). Two tests guard this: a source scan, and a dispatch trace of a full conversion plus streaming run, which asserts float64 only appears inside CPU-only helpers |
+| Ops missing from older PyTorch MPS builds | `PYTORCH_ENABLE_MPS_FALLBACK=1` is set before `import torch` in every v3 entry point and in `modules/v3/__init__.py` |
+| FFT/complex front-ends: Whisper log-mel, BigVGAN mel, Kaldi fbank, sinc resampling | Run on the CPU when the model is on MPS. They're cheap and give identical results across macOS/PyTorch versions |
+| CTC loss support varies by PyTorch version on MPS | Computed on the CPU (exact; gradients flow back to MPS) |
+| Whisper encoder ran in fp32 everywhere except CUDA | fp16 on MPS too: 2.5 GB → 1.3 GB |
+| DiT precision | Autocast fp16 on MPS. bf16 needs macOS 14 (PyTorch's rule), otherwise fp16. With no MPS autocast (old PyTorch), fp32 with a warning. Disabled autocast is a true no-op, so there are no per-block warnings |
+| MPS runs asynchronously, so stage timings were wrong | `torch.mps.synchronize()` before reading clocks |
+| Device selection | CUDA > MPS > CPU in every CLI, with a `--device` flag |
+
+### Validate on your Mac
+```
+V3_TEST_DEVICE=mps python -m pytest tests/v3 -q
+python tools/v3_dry_run.py --device mps --quick
+python realtime_v3.py --simulate examples/source/source_s1.wav --reference examples/reference/s1p1.wav --dry-run --max-seconds 2
+```
+The dry run's last line, "compute budget per block", prints:
+- the TFLOPS your Mac achieves per stage;
+- the projected compute per 100 ms block;
+- whether the real-time preset fits.
+
+### Why real time does not fit an M1
+FLOPs per streaming block, measured with `torch.utils.flop_counter` on the real models:
+
+| Per block | `rt` preset (100 ms block, 8 steps, no CFG, 15 s pad) | quality preset (180 ms block, 10 steps, CFG, 30 s pad) |
+|---|---|---|
+| Whisper-large-v3 encoder | 953 GFLOP | 1,905 GFLOP |
+| DiT with cached prefix (uncached) | 63 (464) GFLOP | 720 (3,444) GFLOP |
+| BigVGAN-v2 44k | 106 GFLOP | 138 GFLOP |
+| **Sustained throughput needed for real time** | **11.2 TFLOPS** | **15.4 TFLOPS** |
+
+Apple's quoted FP32 peaks are 2.6 TFLOPS for M1 (8-core GPU), 5.2 for M1 Pro (16-core) and 10.4 for M1 Max (32-core). Even at 100% utilisation, no M1 reaches the `rt` budget.
+- *Uncertainty:* I haven't verified whether M1's GPU runs fp16 faster than the FP32 figure. Even at 2×, only an M1 Max could fit, and only at more than 54% sustained utilisation. That is unlikely for PyTorch MPS (*unverified*; the dry run measures it).
+- Without the encoder, DiT plus vocoder still needs about 1.7 TFLOPS sustained in the `rt` preset. BigVGAN-44k alone needs about 1.1 TFLOPS.
+
+Memory (measured parameter counts):
+
+| Preset | Footprint | Breakdown |
+|---|---|---|
+| `rt` | ≈ 2.3 GB + activations | encoder 1.3 GB fp16, DiT 0.27 GB, vocoder 0.45 GB, prefix cache ~0.1 GB fp16 |
+| quality | ≈ 3.5 GB + activations | as above, plus DiT 0.75 GB and prefix cache ~0.5 GB fp16 |
+
+An 8 GB M1 works for `rt` but is tight next to macOS. On 8 GB Macs, lower `inference_v3.py --max-context-seconds`.
+
+Offline conversion is viable. Example: 10 s of audio with the quality preset (25 steps + CFG) measures 36.4 TFLOP:
+
+| Chip | Estimated time for 10 s of audio |
+|---|---|
+| M1 | 23–47 s |
+| M1 Pro | 12–23 s |
+| M1 Max | 6–12 s |
+
+These estimates assume 30–60% of peak. About 10 steps halves them.
+
+### Options if real time on the Mac is required (your decision)
+1. **Keep v3 as specified.** Use the M1 for offline conversion and development, and a CUDA GPU (local or cloud) for real time. No code change.
+2. **A Mac real-time variant.** This departs from the v3 spec. It replaces the two dominant costs:
+   - the encoder → a windowed SSL encoder with no 30 s padding, like v1's 12-layer XLSR real-time model;
+   - the vocoder → a lighter one.
+
+   It would also use fewer DiT steps (1–2 after a mean-flow retrain). Rough budget: ~0.2 TFLOP per 100 ms block, which is plausible on M1 Pro/Max and unlikely on base M1 (*estimate*). It needs an SSL-encoder option in v3, a new preset and its own training run.
+3. **Larger blocks (≥ 0.5 s).** These amortise the fixed encoder cost on an M1 Max but push latency well past 400 ms. Not recommended.
+
+## 12. Open questions for you
+- Which M1 exactly (M1 / M1 Pro / M1 Max, and RAM)? See §11: real time does not fit any M1 with this spec.
+- Is real time on the Mac a must (§11 option 2), or is offline on the Mac plus a CUDA GPU for live use acceptable (option 1)?
 - Speech-only, or singing too? Singing needs `f0_condition: true` (RMVPE adds ~10–20 ms per block, *unverified*).
 - Do you have transcripts? If not, run `tools/pseudo_label_v3.py` first (turbo decoder).

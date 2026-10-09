@@ -24,6 +24,8 @@ import inspect
 import torch
 import torch.nn.functional as F
 
+from modules.v3.device import frontend_device
+
 SAMPLE_RATE = 16000
 N_FFT = 400
 HOP_LENGTH = 160
@@ -108,18 +110,24 @@ class WhisperContentEncoder(torch.nn.Module):
         return (n_mel + 1) // 2
 
     def log_mel(self, waves_16k):
-        """(B, N) -> (B, n_mels, N // 160), identical to WhisperFeatureExtractor's torch path."""
-        waves_16k = waves_16k.float()
+        """(B, N) -> (B, n_mels, N // 160), identical to WhisperFeatureExtractor's torch path.
+
+        Runs in fp32 (buffers may have been cast by module.half()) and on the CPU when
+        the input lives on MPS; the result is returned on the input's device.
+        """
+        device = waves_16k.device
+        fdev = frontend_device(device)
+        waves_16k = waves_16k.float().to(fdev)
         if waves_16k.size(-1) < N_FFT:
             waves_16k = F.pad(waves_16k, (0, N_FFT - waves_16k.size(-1)))
-        # buffers may have been cast by module.half(); the front-end always runs in fp32
-        stft = torch.stft(waves_16k, N_FFT, HOP_LENGTH, window=self.window.float(), return_complex=True)
+        window = self.window.float().to(fdev)
+        stft = torch.stft(waves_16k, N_FFT, HOP_LENGTH, window=window, return_complex=True)
         magnitudes = stft[..., :-1].abs() ** 2
-        mel_spec = self.mel_filters.float().T @ magnitudes
+        mel_spec = self.mel_filters.float().to(fdev).T @ magnitudes
         log_spec = torch.clamp(mel_spec, min=1e-10).log10()
         max_val = log_spec.amax(dim=(1, 2), keepdim=True)
         log_spec = torch.maximum(log_spec, max_val - 8.0)
-        return (log_spec + 4.0) / 4.0
+        return ((log_spec + 4.0) / 4.0).to(device)
 
     def encode_log_mel(self, mel):
         """(B, n_mels, F) -> (B, ceil(F / 2), d_model) without HF's 3000-frame restriction."""

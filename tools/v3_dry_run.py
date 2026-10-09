@@ -16,12 +16,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 os.environ.setdefault("HF_HUB_CACHE", "./checkpoints/hf_cache")
+if sys.platform == "darwin":  # must precede `import torch`: run ops missing on MPS on the CPU
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import librosa
 import numpy as np
 import torch
 
 from modules.v3.audio import MelSpectrogram
+from modules.v3.device import pick_device, synchronize
 from modules.v3.dit import PrefixKVStore
 from modules.v3.model import SeedVCv3
 from modules.v3.realtime_io import RealtimeVCStream, simulate_stream
@@ -50,9 +53,16 @@ def params(module):
     return round(sum(p.numel() for p in module.parameters()) / 1e6, 1)
 
 
+DEVICE = None  # set in main(); timings synchronise CUDA / MPS before reading the clock
+
+
 def timed(fn, *a, **kw):
+    if DEVICE is not None:
+        synchronize(DEVICE)
     t = time.perf_counter()
     out = fn(*a, **kw)
+    if DEVICE is not None:
+        synchronize(DEVICE)
     return out, time.perf_counter() - t
 
 
@@ -61,12 +71,17 @@ def main(argv=None):
     p.add_argument("--v1-checkpoint", default=None, help=f"default: {V1_44K} from Plachta/Seed-VC")
     p.add_argument("--quick", action="store_true", help="shorter audio, fewer steps")
     p.add_argument("--out-dir", default="runs/v3_dry_run")
+    p.add_argument("--device", default=None, help="cuda | mps | cpu (default: best available)")
     args = p.parse_args(argv)
     torch.manual_seed(0)
     torch.set_num_threads(max(1, os.cpu_count() or 1))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    global DEVICE
+    device = DEVICE = pick_device(args.device)
     R = Report()
-    R.info("environment", device=str(device), torch=torch.__version__, threads=torch.get_num_threads())
+    import platform
+
+    R.info("environment", device=str(device), torch=torch.__version__, threads=torch.get_num_threads(),
+           platform=platform.platform(), mps_fallback=os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"))
 
     # 1. build the quality preset with real frozen components ------------------------------------------
     model, t_build = timed(SeedVCv3, "configs/v3/seed_vc_v3_44k.yml")
@@ -181,8 +196,39 @@ def main(argv=None):
             prefix_cache_mb=round(rep["prefix_cache_mb"], 1), dit_window_frames=rep["dit_window_frames"])
     R.info("latency budget", rt_preset_algorithmic_ms=rep["algorithmic_ms"],
            quality_preset_algorithmic_ms=180 + 40 + 40 + 20,
-           note="end-to-end = algorithmic + device I/O; compute per block must stay < block_time (GPU required)")
+           note="end-to-end = algorithmic + device I/O; compute per block must stay < block_time")
     sf.write(os.path.join(out_dir, "streaming_dry_run.wav"), sim, stream.sr)
+
+    # 8. compute budget: FLOPs per block at the rt preset defaults vs what this device achieved ------------
+    from torch.utils.flop_counter import FlopCounterMode
+
+    def count_flops(fn):
+        with FlopCounterMode(display=False) as fc:
+            fn()
+        return fc.get_total_flops()
+
+    preset = rt.streaming_engine()  # preset defaults: steps, cfg
+    preset.set_reference(reference)
+    C, D = rt.mel_fn.n_mels, rt.config.model_params.DiT.content_dim
+    n_voc = -(-preset.emit_out // rt.hop) + 1 + 2 * preset.cfg.vocoder_pad_frames
+    with torch.inference_mode():
+        flops = {
+            "encoder": count_flops(lambda: rt.extract_content(preset.in_buffer[None])),
+            "dit": count_flops(lambda: preset.sampler.sample(torch.zeros(1, preset.n_mel, D, device=device),
+                                                             torch.zeros(1, C, preset.n_mel, device=device))),
+            "vocoder": count_flops(lambda: rt.vocoder(torch.zeros(1, C, n_voc, device=device))),
+        }
+    block_s = preset.n_block * 0.02
+    stage_s = {k: rep["stage_mean_ms"][k] / 1000 for k in flops}
+    sim_dit_flops = flops["dit"] * eng.cfg.diffusion_steps / preset.cfg.diffusion_steps  # simulation used fewer steps
+    achieved = {k: (sim_dit_flops if k == "dit" else flops[k]) / stage_s[k] for k in flops}
+    projected_ms = 1000 * sum(flops[k] / achieved[k] for k in flops)
+    R.info("compute budget per block (rt preset defaults)", device=str(device),
+           gflops={k: round(v / 1e9, 1) for k, v in flops.items()},
+           required_tflops_for_realtime=round(sum(flops.values()) / block_s / 1e12, 2),
+           achieved_tflops={k: round(v / 1e12, 3) for k, v in achieved.items()},
+           projected_compute_ms=round(projected_ms, 1), block_ms=round(1000 * block_s),
+           realtime_feasible=projected_ms < 1000 * block_s)
 
     with open(os.path.join(out_dir, "report.json"), "w") as f:
         json.dump(R.items, f, indent=2, default=str)
