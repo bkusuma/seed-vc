@@ -1,5 +1,9 @@
 """Seed-VC v3 headless real-time voice conversion (no GUI dependencies).
 
+EXPERIMENTAL / UNMAINTAINED: real-time v3 is not supported and is no longer developed.
+It cannot run in real time on Apple Silicon (v3_upgrade_plan.md §11) and was never
+validated on CUDA. For live conversion use real-time-gui.py (v1).
+
 Live (needs PortAudio + a trained checkpoint):
     python realtime_v3.py --config configs/v3/seed_vc_v3_44k_rt.yml --checkpoint runs/dit/v3_dit_final.pth \\
         --reference ref.wav [--input-device N --output-device M] [--no-aec] [--no-agc]
@@ -67,6 +71,8 @@ def main(argv=None):
     p.add_argument("--echo-gain-db", type=float, default=None, help="simulation: add a synthetic echo path")
     p.add_argument("--max-seconds", type=float, default=None, help="simulation: truncate the input")
     args = p.parse_args(argv)
+    print("WARNING: realtime_v3.py is experimental and unmaintained; real-time v3 is not supported "
+          "(see v3_upgrade_plan.md section 11).")
 
     if not args.checkpoint and not args.dry_run:
         p.error("no v3 checkpoint given; pass --checkpoint or --dry-run")

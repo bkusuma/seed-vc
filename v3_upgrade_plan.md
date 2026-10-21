@@ -44,6 +44,8 @@ Scope: additive. v1 (`inference.py`, `real-time-gui.py`, `train.py`) and v2 (`*_
 
    The Whisper-large-v3 encoder alone is 85% of that budget. *Confidence: high on the FLOPs; the conclusion holds even at 100% utilisation.*
 
+   **Owner decision (2026-10-21): real-time development is stopped.** The target machine is an M1 Max MacBook Pro (24-core GPU, 64 GB unified memory shared with LLM workloads), used for offline conversion only. The real-time code (`realtime_v3.py`, `modules/v3/streaming.py`, `modules/v3/realtime_io.py`) stays as experimental, unmaintained code and is not updated further.
+
 ---
 
 ## 1. Phase 1 findings (current state)
@@ -390,7 +392,12 @@ Offline conversion is viable. Example: 10 s of audio with the quality preset (25
 
 These estimates assume 30–60% of peak. About 10 steps halves them.
 
-### Options if real time on the Mac is required (your decision)
+### Decision: offline only on the Mac (real-time development stopped 2026-10-21)
+Option 1 below was chosen. Options 2–3 are kept for the record and will not be pursued.
+
+The target machine is an M1 Max with the **24-core** GPU: about 7.8 TFLOPS FP32. That figure is Apple's 10.4 TFLOPS for the 32-core part scaled to 24 cores, not a published spec. The 10 s offline example (36.4 TFLOP) is therefore an estimated **8–16 s** at 30–60% utilisation. Memory is shared with LLM workloads; offline conversion needs an estimated 4–7 GB peak at the default 30 s context (unmeasured). `--max-context-seconds 15` cuts the attention memory about 4×.
+
+Options considered:
 1. **Keep v3 as specified.** Use the M1 for offline conversion and development, and a CUDA GPU (local or cloud) for real time. No code change.
 2. **A Mac real-time variant.** This departs from the v3 spec. It replaces the two dominant costs:
    - the encoder → a windowed SSL encoder with no 30 s padding, like v1's 12-layer XLSR real-time model;
@@ -400,7 +407,5 @@ These estimates assume 30–60% of peak. About 10 steps halves them.
 3. **Larger blocks (≥ 0.5 s).** These amortise the fixed encoder cost on an M1 Max but push latency well past 400 ms. Not recommended.
 
 ## 12. Open questions for you
-- Which M1 exactly (M1 / M1 Pro / M1 Max, and RAM)? See §11: real time does not fit any M1 with this spec.
-- Is real time on the Mac a must (§11 option 2), or is offline on the Mac plus a CUDA GPU for live use acceptable (option 1)?
-- Speech-only, or singing too? Singing needs `f0_condition: true` (RMVPE adds ~10–20 ms per block, *unverified*).
+- Speech-only, or singing too? Singing needs `f0_condition: true` plus RMVPE pitch extraction. f0-conditioned v3 inference is not wired yet: `convert()` raises NotImplementedError.
 - Do you have transcripts? If not, run `tools/pseudo_label_v3.py` first (turbo decoder).
